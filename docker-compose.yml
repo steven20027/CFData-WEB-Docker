@@ -1,0 +1,29 @@
+services:
+  cfdata:
+    build:
+      context: .
+      args:
+        CFDATA_VERSION: v1.8.5
+        # 直连 GitHub 时设为空字符串
+        CFDATA_MIRROR: https://ghfast.top/
+    image: cfdata-web:1.8.5
+    container_name: cfdata
+    volumes:
+      # 来源清单（只读）
+      - ./config:/config:ro
+      # 扫描结果与缓存（ASN 库、locations.json、cfdata-config.json）
+      - ./data:/data
+    environment:
+      CF_MAX_CIDR: "4096"
+      # 延迟阈值（ms），0 表示不筛延迟
+      CF_DELAY: "100"
+      CF_SPEED_MIN: "5"
+      CF_SPEED_LIMIT: "20"
+      CF_SPEED_THREADS: "2"
+      CF_SPEED_URL: "https://speed.cloudflare.com/__down?bytes=50000000"
+      # 地区筛选：留空不筛；填 2 位国家码（HK/JP）或 3 位机房码（HKG/NRT/LAX），可逗号组合
+      CF_REGION: ""
+    # 一次性任务：跑完即退出
+    # 用 bestcf 优选地址作为默认输入时改成 ["bestcf"]（可不挂载 /config）
+    command: ["run"]
+    restart: "no"
