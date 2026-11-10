@@ -571,6 +571,14 @@ func parseText(text, src string, defPort int, add func(string, int, bool), expan
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
+		// 行尾 "#备注" 先去掉:否则 "IP#备注" 这类裸地址会被判非法而整行丢弃
+		// (如 addressesapi 的 198.41.209.168#CM-Default)
+		if i := strings.Index(line, "#"); i >= 0 {
+			line = strings.TrimSpace(line[:i])
+			if line == "" {
+				continue
+			}
+		}
 		found := false
 
 		for _, m := range reV6CIDR.FindAllStringSubmatch(line, -1) {
