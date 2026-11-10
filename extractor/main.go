@@ -100,11 +100,19 @@ func main() {
 	filterCSV := flag.String("filter-csv", "", "扫描结果 CSV；指定后进入过滤模式，按 -region / -exclude-loc 过滤后输出地址清单")
 	regionCodes := flag.String("region", "", "地区码，逗号分隔：2 位国家码（HK/JP/US）或 3 位机房码（HKG/NRT/LAX）")
 	excludeLoc := flag.String("exclude-loc", "", "要排除的出口地区（loc）国家码，逗号分隔：CN、CN,RU；配合 -filter-csv 或 -recheck-csv 使用")
-	recheckCSV := flag.String("recheck-csv", "", "终检用扫描结果 CSV；指定后按 -exclude-loc 从 -recheck-txt 中剔除命中行")
+	recheckCSV := flag.String("recheck-csv", "", "终检用扫描结果 CSV；指定后按 -exclude-loc / -recheck-dc 从 -recheck-txt 中剔除异常行")
 	recheckTXT := flag.String("recheck-txt", "", "终检要就地清理的结果 txt")
+	recheckDC := flag.String("recheck-dc", "", "终检允许的机房码，逗号分隔：NRT、NRT,KIX；阶段 2 落到其它机房的行会被剔除，配合 -recheck-csv 使用")
 	locationsPath := flag.String("locations", "/data/locations.json", "locations.json 路径，用于国家码到机房码的映射")
 	locationsURL := flag.String("locations-url", defaultLocationsURL, "locations.json 缺失时的下载地址")
 	flag.Parse()
+
+	// 本工具不带位置参数，出现多余参数基本都是「多个值没加引号/逗号」造成的，
+	// 例如 -recheck-dc NRT KIX：KIX 会变成位置参数被静默忽略，允许清单只剩 NRT，
+	// 结果里整片机房都会被误判成漂移剔掉。宁可报错，也不能默默丢数据。
+	if rest := flag.Args(); len(rest) > 0 {
+		fatal("无法识别的多余参数: %s（多个取值请用逗号连成一个参数，如 -recheck-dc NRT,KIX）", strings.Join(rest, " "))
+	}
 
 	if *defPort < 1 || *defPort > 65535 {
 		fatal("端口不合法: %d", *defPort)
@@ -113,9 +121,10 @@ func main() {
 		*workers = 1
 	}
 
-	// 终检模式：用阶段 2 的扫描 CSV 复核结果 txt，剔掉出口地区命中排除清单的行
+	// 终检模式：用阶段 2 的扫描 CSV 复核结果 txt，剔掉出口地区命中排除清单、
+	// 或机房漂到 -region 范围之外的行
 	if strings.TrimSpace(*recheckCSV) != "" {
-		runRecheckMode(*recheckCSV, *recheckTXT, *excludeLoc)
+		runRecheckMode(*recheckCSV, *recheckTXT, *excludeLoc, *recheckDC)
 		return
 	}
 	// 地区过滤模式：读 cfdata 扫描得到的 CSV（含「数据中心」「源IP位置」列），按条件过滤出地址
@@ -125,6 +134,9 @@ func main() {
 	}
 	if strings.TrimSpace(*excludeLoc) != "" {
 		fatal("-exclude-loc 需要配合 -filter-csv（过滤模式）或 -recheck-csv（终检模式）使用")
+	}
+	if strings.TrimSpace(*recheckDC) != "" {
+		fatal("-recheck-dc 需要配合 -recheck-csv（终检模式）使用")
 	}
 	// 只给 -region：打印地区码对应的机房列表，便于确认筛选范围
 	if strings.TrimSpace(*regionCodes) != "" {

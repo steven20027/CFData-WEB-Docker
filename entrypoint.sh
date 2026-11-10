@@ -32,6 +32,17 @@ log()  { printf '[cfdata] %s\n' "$*" >&2; }
 warn() { printf '[cfdata] 警告: %s\n' "$*" >&2; }
 die()  { printf '[cfdata] 错误: %s\n' "$*" >&2; exit 1; }
 
+# cfdata 导出的 txt 开头带 UTF-8 BOM（EF BB BF）。这个字节在终端里看不见，但用
+# --data-binary 上传、或交给按行解析的脚本时，第一条会被读成一个多出来的字符，
+# 服务端要么拒收、要么把首行当成坏数据。这里就地删掉。
+# 只处理 txt：CSV 保留 BOM，Excel 靠它识别 UTF-8 中文表头。
+strip_bom() {
+  _f="$1"
+  [ -f "$_f" ] || return 0
+  [ "$(head -c 3 "$_f" | od -An -tx1 | tr -d ' \n')" = "efbbbf" ] || return 0
+  tail -c +4 "$_f" > "${_f}.bomtmp" && mv -f "${_f}.bomtmp" "$_f"
+}
+
 MODE="${1:-run}"
 shift || true
 
@@ -318,34 +329,53 @@ if [ ! -f "$TXT" ]; then
   exit 2
 fi
 
+# 结果 txt 落盘即去 BOM，后面的终检改写、用户上传都按无 BOM 处理
+strip_bom "$TXT"
+
 # ---------- 终检 ----------
-# 阶段 2 会重新握手，出口 IP 有可能落到另一个地区；用阶段 2 的完整 CSV 复核一遍，
-# 把仍命中排除清单的行从结果里剔掉，保证输出里不含被排除的 loc。
-if [ -n "$EXCLUDE_LIST" ] && [ -f "$TXT" ]; then
+# 阶段 2 会重新握手，出口 IP 与接入机房都可能和阶段 1 不一致（实测同一 IP 从 NRT 漂到 MAA）。
+# 用阶段 2 的完整 CSV 复核一遍：命中排除清单的 loc、或落到 -region 范围外的机房，都从结果里剔掉。
+# 只在两阶段流程里做：单机房走 -nsbdc 时扫描与测速是同一条记录，没有漂移的可能。
+# 机房码按空格分隔保存（-region 的输出），传给 -recheck-dc 前换成逗号：
+# 否则不加引号展开时只有第一个码会绑定到参数上，其余变成位置参数被忽略，
+# 结果是「允许清单只剩一个机房」，其余全部被误判成漂移剔掉。
+REGION_COLOS_CSV=$(printf '%s' "$REGION_COLOS" | tr ' ' ',')
+RECHECK_LOC_ARG=""
+[ -n "$EXCLUDE_LIST" ] && RECHECK_LOC_ARG="-exclude-loc $EXCLUDE_LIST"
+RECHECK_DC_ARG=""
+[ -n "$REGION_COLOS_CSV" ] && RECHECK_DC_ARG="-recheck-dc $REGION_COLOS_CSV"
+RECHECK_DESC=""
+[ -n "$EXCLUDE_LIST" ] && RECHECK_DESC="出口地区 ${EXCLUDE_LIST}"
+if [ -n "$REGION_COLOS" ]; then
+  RECHECK_DESC="${RECHECK_DESC:+${RECHECK_DESC}、}机房 $(printf '%s' "$REGION_COLOS" | tr ' ' '/')"
+fi
+
+if [ "$NEED_STAGE1" = "true" ] && [ -f "$TXT" ] && [ -n "$RECHECK_DESC" ]; then
   if [ -f "$CF_OUT.csv" ]; then
     set +e
     DROPPED=$(/usr/local/bin/cfdata-extract \
       -recheck-csv "$CF_OUT.csv" \
       -recheck-txt "$TXT" \
-      -exclude-loc "$EXCLUDE_LIST" 2>/tmp/recheck.log)
+      $RECHECK_LOC_ARG \
+      $RECHECK_DC_ARG 2>/tmp/recheck.log)
     RC=$?
     set -e
     if [ "$RC" -ne 0 ]; then
       warn "终检失败（退出码 $RC），结果未做二次剔除: $(tail -2 /tmp/recheck.log 2>/dev/null | tr '\n' ' ')"
     elif [ "${DROPPED:-0}" -gt 0 ]; then
-      warn "终检剔除了 ${DROPPED} 条出口地区命中 ${EXCLUDE_LIST} 的结果（阶段 2 出口 IP 与阶段 1 不一致）"
+      warn "终检剔除了 ${DROPPED} 条结果：阶段 2 与阶段 1 的 ${RECHECK_DESC} 不一致"
     else
-      log "终检通过：结果中没有 ${EXCLUDE_LIST} 的出口地址"
+      log "终检通过：结果全部落在 ${RECHECK_DESC} 范围内"
     fi
   else
     warn "终检跳过：找不到阶段 2 的扫描结果 $CF_OUT.csv"
   fi
 fi
 
-ROWS=$(tr -d '\357\273\277' < "$TXT" | awk 'NF{c++} END{print c+0}')
+ROWS=$(awk 'NF{c++} END{print c+0}' "$TXT")
 if [ "$ROWS" -eq 0 ]; then
   if [ "${DROPPED:-0}" -gt 0 ]; then
-    warn "结果全部是 ${EXCLUDE_LIST} 的出口地址，已被终检剔除（全量扫描结果见 $CF_OUT.csv）"
+    warn "结果在阶段 2 全部偏离了 ${RECHECK_DESC}，已被终检剔除（全量扫描结果见 $CF_OUT.csv）"
   else
     warn "没有达到 ${CF_SPEED_MIN}MB/s 的地址（全量扫描结果见 $CF_OUT.csv）"
   fi
@@ -360,5 +390,5 @@ if [ -n "$EXCLUDE_LIST" ]; then
   EXCLUDE_DESC="，已排除出口地区 ${EXCLUDE_LIST}"
 fi
 log "达标地址（延迟${DELAY_DESC} 且 ≥${CF_SPEED_MIN}MB/s${EXCLUDE_DESC}）共 $ROWS 条："
-tr -d '\357\273\277' < "$TXT" | sed '/^[[:space:]]*$/d'
+sed '/^[[:space:]]*$/d' "$TXT"
 log "结果文件: $TXT / $CF_OUT.csv"
