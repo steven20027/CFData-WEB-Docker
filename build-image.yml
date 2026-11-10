@@ -1,0 +1,220 @@
+name: build-image
+
+# 触发：
+#   1) push 到 main            -> 只构建并推送镜像（tag: latest / sha-xxxxxxx）
+#   2) push tag v*             -> 构建镜像 + 产出离线 tar.gz + 创建 Release
+#   3) 手动 workflow_dispatch   -> 可指定上游 CFData-WEB 版本，可选是否建 Release
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      cfdata_version:
+        description: '上游 CFData-WEB release 版本（如 v1.8.5）'
+        required: true
+        default: 'v1.8.5'
+      push_image:
+        description: '推送到 GHCR'
+        type: boolean
+        default: true
+      make_release:
+        description: '产出 tar.gz 并创建 Release'
+        type: boolean
+        default: false
+
+env:
+  REGISTRY: ghcr.io
+  CFDATA_VERSION: ${{ inputs.cfdata_version || 'v1.8.5' }}
+
+# 同一分支/标签的旧任务自动取消，避免排队
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # ---------- 计算镜像名与标签 ----------
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.vars.outputs.image }}
+      version: ${{ steps.vars.outputs.version }}
+      label: ${{ steps.vars.outputs.label }}
+      tags: ${{ steps.vars.outputs.tags }}
+    steps:
+      - name: 计算变量
+        id: vars
+        env:
+          CFDATA_VERSION: ${{ env.CFDATA_VERSION }}
+        run: |
+          set -euo pipefail
+          # GHCR 要求仓库名全小写
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+          # 版本：打 tag 时用仓库 tag，否则用上游 CLI 版本 + 短 SHA
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            version="${GITHUB_REF_NAME}"
+            label="${version}"
+          else
+            version="cfdata-${CFDATA_VERSION}"
+            label="${version}-${GITHUB_SHA::7}"
+          fi
+          {
+            echo "image=${image}"
+            echo "version=${version}"
+            echo "label=${label}"
+            echo "tags<<EOF"
+            echo "${image}:latest"
+            echo "${image}:${version}"
+            echo "${image}:sha-${GITHUB_SHA::7}"
+            echo "EOF"
+          } >> "${GITHUB_OUTPUT}"
+          echo "镜像: ${image}  标签: latest / ${version} / sha-${GITHUB_SHA::7}"
+
+  # ---------- 多架构镜像 -> GHCR ----------
+  publish:
+    needs: meta
+    if: github.event_name != 'workflow_dispatch' || inputs.push_image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      # 无需 docker/setup-qemu：Dockerfile 两个构建阶段都是 BUILDPLATFORM，
+      # 最终阶段零 RUN，arm64 只做 COPY，不执行目标架构二进制。
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 构建并推送 linux/amd64,linux/arm64
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ needs.meta.outputs.tags }}
+          # runner 直连 GitHub 比加速镜像更快，这里把 MIRROR 置空
+          build-args: |
+            CFDATA_VERSION=${{ env.CFDATA_VERSION }}
+            CFDATA_MIRROR=
+          labels: |
+            org.opencontainers.image.version=${{ needs.meta.outputs.version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha,scope=multiarch
+          cache-to: type=gha,scope=multiarch,mode=max
+
+      - name: 镜像摘要
+        run: |
+          echo "### 已推送" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+          echo "docker pull ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}" >> "${GITHUB_STEP_SUMMARY}"
+          echo '```' >> "${GITHUB_STEP_SUMMARY}"
+
+  # ---------- 每架构导出离线 tar.gz ----------
+  bundle:
+    needs: meta
+    if: startsWith(github.ref, 'refs/tags/') || inputs.make_release
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            arch: amd64
+          - platform: linux/arm64
+            arch: arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      # 用 --load + docker save 而不是 type=docker 导出：
+      #   - type=docker 在 docker driver 下不被支持，且会被 provenance 的
+      #     提示清单（manifest list）卡住
+      #   - docker save 任何 driver 都通用，产物就是标准 docker load 包
+      - name: 构建 ${{ matrix.arch }} 镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: cfdata-web:${{ matrix.arch }}
+          provenance: false
+          sbom: false
+          build-args: |
+            CFDATA_VERSION=${{ env.CFDATA_VERSION }}
+            CFDATA_MIRROR=
+          cache-from: type=gha,scope=multiarch
+
+      - name: 压缩并计算校验值
+        run: |
+          set -euo pipefail
+          name="cfdata-web_${{ needs.meta.outputs.label }}_${{ matrix.arch }}"
+          docker save "cfdata-web:${{ matrix.arch }}" | gzip -9 > "${RUNNER_TEMP}/${name}.tar.gz"
+          cd "${RUNNER_TEMP}"
+          sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          ls -lh "${name}.tar.gz"
+          echo "SIZE=$(du -h "${name}.tar.gz" | cut -f1)" >> "${GITHUB_ENV}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-${{ matrix.arch }}
+          path: |
+            ${{ runner.temp }}/*.tar.gz
+            ${{ runner.temp }}/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  # ---------- 汇总产物并创建 Release ----------
+  release:
+    needs: [meta, bundle]
+    if: startsWith(github.ref, 'refs/tags/') || inputs.make_release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验清单
+        run: |
+          set -euo pipefail
+          cd dist
+          cat *.sha256 > checksums.txt
+          rm -f *.sha256
+          ls -lh
+
+      - name: 发布 Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.version }}
+          name: ${{ needs.meta.outputs.version }}
+          # tag 触发时 tag 已存在；手动触发会基于当前提交新建同名 tag
+          target_commitish: ${{ github.sha }}
+          fail_on_unmatched_files: true
+          files: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          body: |
+            基于上游 CFData-WEB `${{ env.CFDATA_VERSION }}` 的扫描镜像。
+
+            **在线拉取（自动匹配架构）**
+            ```bash
+            docker pull ${{ needs.meta.outputs.image }}:${{ needs.meta.outputs.version }}
+            ```
+
+            **离线导入**
+            ```bash
+            docker load -i cfdata-web_${{ needs.meta.outputs.label }}_amd64.tar.gz
+            docker load -i cfdata-web_${{ needs.meta.outputs.label }}_arm64.tar.gz
+            ```
+
+            校验：`sha256sum -c checksums.txt`
