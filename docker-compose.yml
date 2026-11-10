@@ -23,6 +23,9 @@ services:
       CF_SPEED_URL: "https://speed.cloudflare.com/__down?bytes=50000000"
       # 地区筛选：留空不筛；填 2 位国家码（HK/JP）或 3 位机房码（HKG/NRT/LAX），可逗号组合
       CF_REGION: ""
+      # 出口地区排除：留空不排除；填 2 位国家码（loc），可逗号组合，如 CN 或 CN,RU
+      # 设置后会改走两阶段（全量扫描 -> 剔除 -> 定向测速），耗时略长
+      CF_EXCLUDE_LOC: ""
     # 一次性任务：跑完即退出
     # 用 bestcf 优选地址作为默认输入时改成 ["bestcf"]（可不挂载 /config）
     command: ["run"]

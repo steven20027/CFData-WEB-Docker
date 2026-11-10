@@ -54,8 +54,8 @@ FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS build
 ARG TARGETARCH
 WORKDIR /src
 COPY extractor/go.mod ./
-COPY extractor/main.go ./
-COPY extractor/region.go ./
+# 用通配符整目录拷贝：extractor 下新增 .go 文件时不必再改这里
+COPY extractor/*.go ./
 RUN set -eux; \
     export CGO_ENABLED=0 GOOS=linux GOARCH="${TARGETARCH}" GOFLAGS=-mod=mod; \
     go build -trimpath -ldflags="-s -w" -o /out/cfdata-extract .
@@ -94,7 +94,8 @@ ENV CF_SOURCES=/config/sources.txt \
     CF_BESTCF_URL=https://bestcf.pages.dev/ \
     CF_BESTCF_TTL=3h \
     CF_BESTCF_CACHE=/data/.cache/bestcf \
-    CF_REGION=
+    CF_REGION= \
+    CF_EXCLUDE_LOC=
 
 WORKDIR /data
 VOLUME ["/data"]

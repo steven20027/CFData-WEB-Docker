@@ -41,9 +41,11 @@ cat data/cfdata-results.txt
 | `cfdata-results.csv` | 所有候选地址的完整记录，包括不合格的，别拿它当合格清单 |
 | `a.txt` | 这次测过的所有地址，留着方便复查 |
 
+用了「排除出口地区」（`CF_EXCLUDE_LOC`）时，还会多出一个 `cfdata-scan-all.csv`。那是中途的一份扫描记录，想知道某个地址为什么被排除时可以翻它，平时不用管，删掉也不影响下次运行。
+
 ## 常用用法
 
-### 只要香港的地址
+### 只要某个地区的地址
 
 ```bash
 docker run --rm -v "$PWD/data:/data" -e CF_REGION=HK cfdata-web:1.8.5 bestcf
@@ -56,6 +58,51 @@ docker run --rm -v "$PWD/data:/data" -e CF_REGION=HK cfdata-web:1.8.5 bestcf
 ```bash
 docker run --rm cfdata-web:1.8.5 extractor -region JP
 ```
+
+### 不要某个出口地区的地址
+
+结果里有时会看到 `NRT-CN` 这种：走的是东京机房（`NRT`），但你这边的出口 IP 归属地是中国（`CN`）。如果你需要出口「看起来」不在国内，这类地址虽然延迟低、速度也不差，但对你没用。
+
+这种情况比想象中普遍。实际跑日本机房那一轮，20 条达标结果里有 17 条是 `NRT-CN`，只有 3 条出口真的在日本。所以想要干净出口，建议一开始就排除：
+
+```bash
+docker run --rm -v "$PWD/data:/data" -e CF_EXCLUDE_LOC=CN cfdata-web:1.8.5 bestcf
+```
+
+同样的条件加上排除后，结果从 20 条变成 5 条，5 条全是 `NRT-JP`，一条 CN 都没有。
+
+写法参考：
+
+| 需求 | 怎么写 |
+| --- | --- |
+| 排除一个国家 | `-e CF_EXCLUDE_LOC=CN` |
+| 排除多个 | `-e CF_EXCLUDE_LOC=CN,RU` |
+| 大小写 | 都行，`cn` 和 `CN` 一样 |
+| 分隔符 | 英文逗号、中文逗号、分号、空格都能认 |
+| 排除三个以上 | 照这样接着加：`CN,RU,IR` |
+
+**只能填 2 位国家码**，比如 `CN`、`RU`、`IR`。填 `NRT` 这种机房名会直接报错并提示你改用 `CF_REGION` —— 机房和出口归属是两回事：机房是地址接入的 Cloudflare 机房，出口是你自己这边的网络出口在哪注册。
+
+**要多花一点时间**。普通一趟就是扫一遍、测一遍；加了排除之后，会先摸清每个地址的机房和出口归属，再只对符合条件的测速，所以比平时多花两成左右时间（实测 2 分 32 秒 → 2 分 55 秒）。日志里会看到「阶段 1/2」「阶段 2/2」，第一次看到不用紧张，第一轮不是白跑的。
+
+**怎么确认结果干净**。跑完会打印一句话：
+
+```
+终检通过：结果中没有 CN 的出口地址
+```
+
+看到这句，就说明 `cfdata-results.txt` 里一条 CN 都没有。
+
+极少数情况下会打印「终检剔除了 N 条」：个别地址在测速那一刻出口变了，已经自动从结果里删掉，不用管。如果打印的是「终检跳过」，说明复核没跑成，结果可能还留着个别漏网的，重跑一次即可。
+
+**和地区筛选一起用**，两个条件同时生效：
+
+```bash
+# 只要日本机房，但不要出口在 CN 的
+docker run --rm -v "$PWD/data:/data" -e CF_REGION=JP -e CF_EXCLUDE_LOC=CN cfdata-web:1.8.5 bestcf
+```
+
+排除后如果结果变得很少，多半是这批地址的出口大多落在你排除的地区 —— 可以放宽延迟（`-e CF_DELAY=150`）让更多地址进测速，或者换个机房试试。
 
 ### 想要速度更快的
 
@@ -112,6 +159,7 @@ docker run --rm -v "$PWD/config:/config:ro" -v "$PWD/data:/data" cfdata-web:1.8.
 | `CF_SPEED_MIN` | 5 | 速度下限（MB/s），越大越挑剔 |
 | `CF_SPEED_LIMIT` | 20 | 最多留几条合格结果，够数就停 |
 | `CF_REGION` | （空） | 只要哪个地区的地址，空表示不限 |
+| `CF_EXCLUDE_LOC` | （空） | 不要出口在哪个地区的地址（`CN`、`CN,RU`），空表示不排除；用了会多花些时间 |
 | `CF_PORT` | 443 | 地址没写端口时默认用这个 |
 | `CF_OUT_FIELDS` | compact | 结果每行显示哪些信息，默认是 `IP:端口#机房-出口地` |
 
@@ -121,11 +169,15 @@ docker run --rm -v "$PWD/config:/config:ro" -v "$PWD/data:/data" cfdata-web:1.8.
 
 | 现象 | 一般是为什么 | 怎么办 |
 | --- | --- | --- |
-| 跑完了，`results.txt` 是空的 | 这一轮没有地址同时满足延迟和速度 | 先放宽标准试试：`-e CF_SPEED_MIN=1`，确认链路没问题再调回去 |
+| 跑完了，`cfdata-results.txt` 是空的 | 这一轮没有地址同时满足延迟和速度 | 先放宽标准试试：`-e CF_SPEED_MIN=1`，确认链路没问题再调回去 |
 | 速度全是 0 或测速失败 | 测速地址被挡了 | 保持默认的 50MB 测速地址，别调大，太大反而会被拒绝 |
 | 构建时下载很慢 | GitHub 直连不稳 | 默认已经走了加速镜像；还不行可以换一个：`--build-arg CFDATA_MIRROR=https://gh-proxy.com/` |
 | 想看的地区一个都没筛出来 | 这批地址在当前网络下没落到那个机房 | 日志里会印出这次实际出现的机房分布，照着改地区码再跑一轮 |
 | 结果里延迟都不到 100ms | 正常 | 默认延迟上限就是 100ms，超的在扫描时已经被筛掉了 |
+| 设了 `CF_EXCLUDE_LOC` 后跑得比以前慢 | 正常 | 用了排除会先摸清每个地址的出口归属，再挑出来测速；日志里「阶段 1/2」就是在做这件事。想快一点可以收紧 `CF_DELAY` |
+| 排除后结果只剩几条，甚至一条不剩 | 这批地址的出口大多在你排除的那个地区 | 放宽 `CF_DELAY` 让更多地址进测速，或换个机房（`CF_REGION`）再试 |
+| 结果里还是有被排除的地区 | 极少数情况下测速那一刻出口变了，而复核没跑成 | 看日志有没有「终检跳过」「终检失败」，有就重跑一次 |
+| `CF_EXCLUDE_LOC` 报「格式不对」 | 填了机房名而不是国家码 | 只能填 2 位国家码（`CN`、`RU`）；要按机房筛选用 `CF_REGION` |
 
 想进容器里自己看：
 
@@ -178,7 +230,8 @@ docker run --rm cfdata-web:1.8.5 shell -c 'ls -la /data && head -3 /data/a.txt'
 | `CF_DNS` | 空 | 自定义 DNS，空表示用 Docker 内置 DNS |
 | `CF_ALLOW_EMPTY` | `0` | `1` 表示无合格结果也返回 0 |
 | `CF_REGION` | 空 | 地区筛选：国家码或机房码，逗号分隔可组合；空表示不筛选 |
-| `CF_SCAN_ALL` | `cfdata-scan-all` | 地区筛选阶段 1 全量扫描结果文件名（落在 `/data`） |
+| `CF_EXCLUDE_LOC` | 空 | 出口地区排除：国家码，逗号分隔可组合（`CN`、`CN,RU`）；命中的地址不会被测速 |
+| `CF_SCAN_ALL` | `cfdata-scan-all` | 用了出口地区排除时，中途那份扫描记录的文件名（落在 `/data`） |
 | `CF_LOCATIONS_URL` | `https://www.baipiao.eu.org/cloudflare/locations` | 机房位置数据缺失时的下载地址 |
 | `CF_BESTCF_URL` | `https://bestcf.pages.dev/` | bestcf 模式抓取的页面 |
 | `CF_BESTCF_TTL` | `3h` | 清单缓存有效期（`30m`、`6h` 这种写法），`0` 每次强制刷新 |
@@ -195,9 +248,9 @@ docker run --rm cfdata-web:1.8.5 shell -c 'ls -la /data && head -3 /data/a.txt'
 | `ipport` | 只有 `ip:port` | `152.175.7.63:8443` |
 | 逗号分隔 | 按书写顺序拼接 | `dc,loc,latency,speed` → `152.175.7.63:8443#HKG-HK-43ms-10.69MB/s` |
 
-`ip:port` 永远在最前，其余字段用 `#` 连接、字段间用 `-` 分隔。可用字段名：`ip`、`port`、`tls`、`lossRate`、`latency`、`scanMode`、`speed`、`outboundIP`、`dc`（数据中心，如 `HKG`）、`loc`（出站 IP 归属国家码，如 `HK`）、`region`、`city`、`asnNumber`、`asnOrg`、`originalInput`、`ipType`。写错的字段名会被忽略，全部无效时只输出 `ip:port`。
+`ip:port` 永远在最前，其余字段用 `#` 连接、字段间用 `-` 分隔。可用字段名：`ip`、`port`、`tls`、`lossRate`、`latency`、`scanMode`、`speed`、`outboundIP`、`dc`（机房，如 `HKG`）、`loc`（出口归属国家码，如 `HK`）、`region`、`city`、`asnNumber`、`asnOrg`、`originalInput`、`ipType`。写错的字段名会被忽略，全部无效时只输出 `ip:port`。
 
-`dc` 与 `loc` 的区别：`dc` 是目标地址实际接入的 Cloudflare 机房（`CF_REGION` 按它筛），`loc` 是出站 IP 的归属地，二者可能不一致。
+怎么看自己在不在乎 `dc` 和 `loc` 的差别：`dc` 是地址接入的 Cloudflare 机房（`CF_REGION` 按它挑），`loc` 是你这一侧出口的归属地（`CF_EXCLUDE_LOC` 按它排除），两者可以不一致 —— 就会出现 `NRT-CN` 这种「机房在日本、出口在国内」的组合。
 
 ### 退出码
 

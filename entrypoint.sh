@@ -24,6 +24,8 @@ CF_BESTCF_CACHE="${CF_BESTCF_CACHE:-/data/.cache/bestcf}"
 # 地区筛选：留空不筛选；支持 2 位国家码（HK/JP/US）或 3 位机房码（HKG/NRT/LAX），可逗号分隔组合
 CF_REGION="${CF_REGION:-}"
 CF_SCAN_ALL="${CF_SCAN_ALL:-cfdata-scan-all}"
+# 出口地区排除：留空不排除；填 2 位国家码（loc，如 CN），逗号分隔可组合（CN,RU）
+CF_EXCLUDE_LOC="${CF_EXCLUDE_LOC:-}"
 export CF_SOURCES
 
 log()  { printf '[cfdata] %s\n' "$*" >&2; }
@@ -67,6 +69,21 @@ is_uint "$CF_DELAY" || die "CF_DELAY 必须是整数: $CF_DELAY"
 case "$CF_SPEED_MIN" in
   ''|*[!0-9.]*) die "CF_SPEED_MIN 必须是数字（MB/s）: $CF_SPEED_MIN" ;;
 esac
+
+# 出口地区码归一化：兼容中英文逗号、分号、斜杠、空格分隔，统一成大写并以逗号连接
+EXCLUDE_LIST=""
+if [ -n "$CF_EXCLUDE_LOC" ]; then
+  _codes=$(printf '%s' "$CF_EXCLUDE_LOC" | sed 's/[，；]/ /g; s/[,;\/|]/ /g; s/  */ /g')
+  for _code in $_codes; do
+    case "$_code" in
+      [A-Za-z][A-Za-z]) ;;
+      *) die "CF_EXCLUDE_LOC 里的 \"$_code\" 格式不对：loc 是 2 位国家码（如 CN）；要按机房筛选请用 CF_REGION" ;;
+    esac
+    EXCLUDE_LIST="$EXCLUDE_LIST $(printf '%s' "$_code" | tr 'a-z' 'A-Z')"
+  done
+  EXCLUDE_LIST=$(printf '%s\n' $EXCLUDE_LIST | sort -u | tr '\n' ',' | sed 's/,$//')
+  [ -n "$EXCLUDE_LIST" ] || die "CF_EXCLUDE_LOC 没有解析出有效地区码: $CF_EXCLUDE_LOC"
+fi
 
 mkdir -p "$CF_WORKDIR"
 cd "$CF_WORKDIR"
@@ -136,13 +153,16 @@ if [ -n "$CF_DNS" ]; then
   DNS_ARG="-dns $CF_DNS"
 fi
 
-# ---------- 地区筛选 ----------
+# ---------- 地区筛选 / 出口地区排除 ----------
 # 地区码先展开成机房码集合：
 #   单机房（HK->HKG、SG->SIN、KR->ICN…）直接用 cfdata 的 -nsbdc 在扫描期过滤，单轮完成；
 #   多机房（JP->4 个、US->47 个）无法用 -nsbdc 表达，走两阶段：全量扫描拿 colo -> 过滤 -> 定向测速。
+# 排除出口地区（CF_EXCLUDE_LOC）要看 loc，而 loc 只存在于扫描结果 CSV 里，
+# 所以只要设了它，一律改走两阶段（-nsbdc 是扫描期过滤，会把 colo/loc 一起丢掉）。
 NSB_DC_ARG=""
+NEED_STAGE1=false
+REGION_COLOS=""
 if [ -n "$CF_REGION" ]; then
-  REGION_INPUT="/tmp/region-input.txt"
   REGION_LOG="/tmp/region-colo.log"
   REGION_COLOS=$(/usr/local/bin/cfdata-extract \
     -region "$CF_REGION" \
@@ -156,73 +176,93 @@ if [ -n "$CF_REGION" ]; then
   COLO_COUNT=$(printf '%s\n' $REGION_COLOS | sed '/^$/d' | wc -l | tr -d ' ')
   [ "$COLO_COUNT" -ge 1 ] || die "地区码 ${CF_REGION} 没有对应任何机房"
 
-  if [ "$COLO_COUNT" -eq 1 ]; then
+  if [ "$COLO_COUNT" -eq 1 ] && [ -z "$EXCLUDE_LIST" ]; then
     NSB_DC_ARG="-nsbdc $REGION_COLOS"
     log "地区 ${CF_REGION} -> 机房 ${REGION_COLOS}（单机房），扫描时直接按机房筛选"
   else
-    rm -f "$CF_WORKDIR/$CF_SCAN_ALL" "$CF_WORKDIR/$CF_SCAN_ALL.csv" "$CF_WORKDIR/$CF_SCAN_ALL.txt" "$REGION_INPUT"
-    log "地区 ${CF_REGION} -> ${COLO_COUNT} 个机房（$REGION_COLOS），阶段 1/2 先全量扫描获取机房归属（地址多时需要几分钟）"
-    STAGE1_LOG="/tmp/stage1-scan.log"
-    set +e
-    /usr/local/bin/cfdata -cli \
-      -mode nsb \
-      -nsbfile "$INPUT" \
-      -nsbtls=true \
-      -nsbfallbackport "$CF_PORT" \
-      -nsbthreads "$CF_THREADS" \
-      -nsbresultlimit 100000 \
-      -nsbdelay "$CF_DELAY" \
-      -nsbspeedtest 0 \
-      -relink=false \
-      $DNS_ARG \
-      -skipgeo \
-      -nocolor \
-      -out "$CF_SCAN_ALL" \
-      -outformat csv \
-      -outfields compact \
-      -outqualified all \
-      -outstartrow 1 \
-      -outendrow 0 \
-      -progress=false \
-      -config "$CFG" > "$STAGE1_LOG" 2>&1
-    RC=$?
-    set -e
-    if [ "$RC" -ne 0 ]; then
-      tail -20 "$STAGE1_LOG" >&2 || true
-      die "阶段 1 扫描失败（退出码 $RC，完整日志 $STAGE1_LOG）"
-    fi
-    # 逐条 scan-result 太啰嗦：只回显汇总行，完整日志留在 /tmp/stage1-scan.log
-    grep -v "scan-result" "$STAGE1_LOG" 2>/dev/null | tail -5 >&2 || true
-
-    # -outformat csv 会额外写一份同名无扩展名文件，只保留 .csv 供查看/过滤
-    SCAN_ALL_CSV="$CF_WORKDIR/$CF_SCAN_ALL.csv"
-    if [ -f "$SCAN_ALL_CSV" ]; then
-      rm -f "$CF_WORKDIR/$CF_SCAN_ALL"
-    else
-      SCAN_ALL_CSV="$CF_WORKDIR/$CF_SCAN_ALL"
-    fi
-    [ -f "$SCAN_ALL_CSV" ] || die "阶段 1 没有产出扫描结果（地址可能全部不可用）"
-    rm -f "$CF_WORKDIR/$CF_SCAN_ALL.txt"
-
-    /usr/local/bin/cfdata-extract \
-      -filter-csv "$SCAN_ALL_CSV" \
-      -region "$CF_REGION" \
-      -locations "$CF_WORKDIR/locations.json" \
-      -locations-url "${CF_LOCATIONS_URL:-https://www.baipiao.eu.org/cloudflare/locations}" \
-      -cache-dir "$CF_BESTCF_CACHE" \
-      -out "$REGION_INPUT" || die "地区码解析或过滤失败，请检查 CF_REGION（见上方提示）"
-
-    HIT=$(wc -l < "$REGION_INPUT" | tr -d ' ')
-    if [ "$HIT" -eq 0 ]; then
-      warn "地区 ${CF_REGION} 下没有可用地址（全量扫描结果保留在 $SCAN_ALL_CSV，可查看实际机房分布）"
-      if [ "$CF_ALLOW_EMPTY" = "1" ]; then
-        exit 0
-      fi
-      exit 2
-    fi
-    log "阶段 1/2 完成：命中地区地址 $HIT 条，阶段 2/2 只对这些地址扫描测速"
-    INPUT="$REGION_INPUT"
+    NEED_STAGE1=true
+    log "地区 ${CF_REGION} -> ${COLO_COUNT} 个机房（$REGION_COLOS）"
   fi
+fi
+
+if [ -n "$EXCLUDE_LIST" ]; then
+  NEED_STAGE1=true
+  log "排除出口地区（loc）: ${EXCLUDE_LIST}，命中这些地区的地址会在测速前剔除"
+fi
+
+if [ "$NEED_STAGE1" = "true" ]; then
+  FILTER_INPUT="/tmp/filter-input.txt"
+  rm -f "$CF_WORKDIR/$CF_SCAN_ALL" "$CF_WORKDIR/$CF_SCAN_ALL.csv" "$CF_WORKDIR/$CF_SCAN_ALL.txt" "$FILTER_INPUT"
+  log "阶段 1/2：全量扫描获取机房与出口归属（地址多时需要几分钟）"
+  STAGE1_LOG="/tmp/stage1-scan.log"
+  set +e
+  /usr/local/bin/cfdata -cli \
+    -mode nsb \
+    -nsbfile "$INPUT" \
+    -nsbtls=true \
+    -nsbfallbackport "$CF_PORT" \
+    -nsbthreads "$CF_THREADS" \
+    -nsbresultlimit 100000 \
+    -nsbdelay "$CF_DELAY" \
+    -nsbspeedtest 0 \
+    -relink=false \
+    $DNS_ARG \
+    -skipgeo \
+    -nocolor \
+    -out "$CF_SCAN_ALL" \
+    -outformat csv \
+    -outfields compact \
+    -outqualified all \
+    -outstartrow 1 \
+    -outendrow 0 \
+    -progress=false \
+    -config "$CFG" > "$STAGE1_LOG" 2>&1
+  RC=$?
+  set -e
+  if [ "$RC" -ne 0 ]; then
+    tail -20 "$STAGE1_LOG" >&2 || true
+    die "阶段 1 扫描失败（退出码 $RC，完整日志 $STAGE1_LOG）"
+  fi
+  # 逐条 scan-result 太啰嗦：只回显汇总行，完整日志留在 /tmp/stage1-scan.log
+  grep -v "scan-result" "$STAGE1_LOG" 2>/dev/null | tail -5 >&2 || true
+
+  # -outformat csv 会额外写一份同名无扩展名文件，只保留 .csv 供查看/过滤
+  SCAN_ALL_CSV="$CF_WORKDIR/$CF_SCAN_ALL.csv"
+  if [ -f "$SCAN_ALL_CSV" ]; then
+    rm -f "$CF_WORKDIR/$CF_SCAN_ALL"
+  else
+    SCAN_ALL_CSV="$CF_WORKDIR/$CF_SCAN_ALL"
+  fi
+  [ -f "$SCAN_ALL_CSV" ] || die "阶段 1 没有产出扫描结果（地址可能全部不可用）"
+  rm -f "$CF_WORKDIR/$CF_SCAN_ALL.txt"
+
+  FILTER_REGION_ARG=""
+  if [ -n "$CF_REGION" ]; then
+    FILTER_REGION_ARG="-region $CF_REGION"
+  fi
+  FILTER_EXCLUDE_ARG=""
+  if [ -n "$EXCLUDE_LIST" ]; then
+    FILTER_EXCLUDE_ARG="-exclude-loc $EXCLUDE_LIST"
+  fi
+  /usr/local/bin/cfdata-extract \
+    -filter-csv "$SCAN_ALL_CSV" \
+    $FILTER_REGION_ARG \
+    $FILTER_EXCLUDE_ARG \
+    -locations "$CF_WORKDIR/locations.json" \
+    -locations-url "${CF_LOCATIONS_URL:-https://www.baipiao.eu.org/cloudflare/locations}" \
+    -cache-dir "$CF_BESTCF_CACHE" \
+    -out "$FILTER_INPUT" || die "扫描结果筛选失败（地区 ${CF_REGION:-不限} / 排除出口地区 ${EXCLUDE_LIST:-无}）"
+
+  HIT=$(wc -l < "$FILTER_INPUT" | tr -d ' ')
+  if [ "$HIT" -eq 0 ]; then
+    warn "筛选后没有剩余地址（地区=${CF_REGION:-不限} 排除出口地区=${EXCLUDE_LIST:-无}）；全量扫描结果保留在 $SCAN_ALL_CSV，可查看实际分布"
+    if [ "$CF_ALLOW_EMPTY" = "1" ]; then
+      exit 0
+    fi
+    exit 2
+  fi
+  log "阶段 1/2 完成：命中 ${HIT} 条地址，阶段 2/2 只对这些地址扫描测速"
+  INPUT="$FILTER_INPUT"
 fi
 
 # 清掉上一轮结果，避免本轮 0 条时误读旧文件
@@ -278,15 +318,47 @@ if [ ! -f "$TXT" ]; then
   exit 2
 fi
 
+# ---------- 终检 ----------
+# 阶段 2 会重新握手，出口 IP 有可能落到另一个地区；用阶段 2 的完整 CSV 复核一遍，
+# 把仍命中排除清单的行从结果里剔掉，保证输出里不含被排除的 loc。
+if [ -n "$EXCLUDE_LIST" ] && [ -f "$TXT" ]; then
+  if [ -f "$CF_OUT.csv" ]; then
+    set +e
+    DROPPED=$(/usr/local/bin/cfdata-extract \
+      -recheck-csv "$CF_OUT.csv" \
+      -recheck-txt "$TXT" \
+      -exclude-loc "$EXCLUDE_LIST" 2>/tmp/recheck.log)
+    RC=$?
+    set -e
+    if [ "$RC" -ne 0 ]; then
+      warn "终检失败（退出码 $RC），结果未做二次剔除: $(tail -2 /tmp/recheck.log 2>/dev/null | tr '\n' ' ')"
+    elif [ "${DROPPED:-0}" -gt 0 ]; then
+      warn "终检剔除了 ${DROPPED} 条出口地区命中 ${EXCLUDE_LIST} 的结果（阶段 2 出口 IP 与阶段 1 不一致）"
+    else
+      log "终检通过：结果中没有 ${EXCLUDE_LIST} 的出口地址"
+    fi
+  else
+    warn "终检跳过：找不到阶段 2 的扫描结果 $CF_OUT.csv"
+  fi
+fi
+
 ROWS=$(tr -d '\357\273\277' < "$TXT" | awk 'NF{c++} END{print c+0}')
 if [ "$ROWS" -eq 0 ]; then
-  warn "没有达到 ${CF_SPEED_MIN}MB/s 的地址（全量扫描结果见 $CF_OUT.csv）"
+  if [ "${DROPPED:-0}" -gt 0 ]; then
+    warn "结果全部是 ${EXCLUDE_LIST} 的出口地址，已被终检剔除（全量扫描结果见 $CF_OUT.csv）"
+  else
+    warn "没有达到 ${CF_SPEED_MIN}MB/s 的地址（全量扫描结果见 $CF_OUT.csv）"
+  fi
   if [ "$CF_ALLOW_EMPTY" = "1" ]; then
     exit 0
   fi
   exit 2
 fi
 
-log "达标地址（延迟${DELAY_DESC} 且 ≥${CF_SPEED_MIN}MB/s）共 $ROWS 条："
+EXCLUDE_DESC=""
+if [ -n "$EXCLUDE_LIST" ]; then
+  EXCLUDE_DESC="，已排除出口地区 ${EXCLUDE_LIST}"
+fi
+log "达标地址（延迟${DELAY_DESC} 且 ≥${CF_SPEED_MIN}MB/s${EXCLUDE_DESC}）共 $ROWS 条："
 tr -d '\357\273\277' < "$TXT" | sed '/^[[:space:]]*$/d'
 log "结果文件: $TXT / $CF_OUT.csv"

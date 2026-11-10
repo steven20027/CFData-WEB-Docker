@@ -97,8 +97,11 @@ func main() {
 	cacheDir := flag.String("cache-dir", "/data/.cache/bestcf", "bestcf 缓存目录")
 	workers := flag.Int("workers", defaultWorkers, "并发抓取清单数量")
 
-	filterCSV := flag.String("filter-csv", "", "扫描结果 CSV；指定后进入地区过滤模式，按 -region 过滤后输出地址清单")
+	filterCSV := flag.String("filter-csv", "", "扫描结果 CSV；指定后进入过滤模式，按 -region / -exclude-loc 过滤后输出地址清单")
 	regionCodes := flag.String("region", "", "地区码，逗号分隔：2 位国家码（HK/JP/US）或 3 位机房码（HKG/NRT/LAX）")
+	excludeLoc := flag.String("exclude-loc", "", "要排除的出口地区（loc）国家码，逗号分隔：CN、CN,RU；配合 -filter-csv 或 -recheck-csv 使用")
+	recheckCSV := flag.String("recheck-csv", "", "终检用扫描结果 CSV；指定后按 -exclude-loc 从 -recheck-txt 中剔除命中行")
+	recheckTXT := flag.String("recheck-txt", "", "终检要就地清理的结果 txt")
 	locationsPath := flag.String("locations", "/data/locations.json", "locations.json 路径，用于国家码到机房码的映射")
 	locationsURL := flag.String("locations-url", defaultLocationsURL, "locations.json 缺失时的下载地址")
 	flag.Parse()
@@ -110,10 +113,18 @@ func main() {
 		*workers = 1
 	}
 
-	// 地区过滤模式：读 cfdata 扫描得到的 CSV（含「数据中心」列），按地区码过滤出地址
-	if strings.TrimSpace(*filterCSV) != "" {
-		runFilterMode(*filterCSV, *regionCodes, *locationsPath, *locationsURL, *cacheDir, *outPath)
+	// 终检模式：用阶段 2 的扫描 CSV 复核结果 txt，剔掉出口地区命中排除清单的行
+	if strings.TrimSpace(*recheckCSV) != "" {
+		runRecheckMode(*recheckCSV, *recheckTXT, *excludeLoc)
 		return
+	}
+	// 地区过滤模式：读 cfdata 扫描得到的 CSV（含「数据中心」「源IP位置」列），按条件过滤出地址
+	if strings.TrimSpace(*filterCSV) != "" {
+		runFilterMode(*filterCSV, *regionCodes, *excludeLoc, *locationsPath, *locationsURL, *cacheDir, *outPath)
+		return
+	}
+	if strings.TrimSpace(*excludeLoc) != "" {
+		fatal("-exclude-loc 需要配合 -filter-csv（过滤模式）或 -recheck-csv（终检模式）使用")
 	}
 	// 只给 -region：打印地区码对应的机房列表，便于确认筛选范围
 	if strings.TrimSpace(*regionCodes) != "" {

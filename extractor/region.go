@@ -184,14 +184,28 @@ func findColumn(header []string, names ...string) int {
 	return -1
 }
 
-// runFilterMode 从 cfdata 导出的扫描 CSV 中按地区过滤地址，写出 cfdata 可直接消费的清单。
-func runFilterMode(csvPath, region, locPath, locURL, cacheDir, outPath string) {
-	if strings.TrimSpace(region) == "" {
-		fatal("过滤模式必须指定 -region")
+// runFilterMode 从 cfdata 导出的扫描 CSV 中按机房与出口归属过滤地址，写出 cfdata 可直接消费的清单。
+// 两个条件可单独使用，也可同时使用（取交集）：只给 region 时按机房筛，只给 excludeLoc 时按出口地区剔。
+func runFilterMode(csvPath, region, excludeLoc, locPath, locURL, cacheDir, outPath string) {
+	hasRegion := strings.TrimSpace(region) != ""
+	excludeSet, excludeList, err := parseLocCodes(excludeLoc)
+	if err != nil {
+		fatal("%v", err)
 	}
-	targets, notes := mustResolveRegions(region, locPath, locURL, cacheDir)
-	for _, n := range notes {
-		fmt.Fprintf(os.Stderr, "[cfdata-extract] %s\n", n)
+	if !hasRegion && len(excludeSet) == 0 {
+		fatal("过滤模式需要 -region 或 -exclude-loc（至少给一个）")
+	}
+
+	targets := make(map[string]string, 16)
+	if hasRegion {
+		var notes []string
+		targets, notes = mustResolveRegions(region, locPath, locURL, cacheDir)
+		for _, n := range notes {
+			fmt.Fprintf(os.Stderr, "[cfdata-extract] %s\n", n)
+		}
+	}
+	if len(excludeList) > 0 {
+		fmt.Fprintf(os.Stderr, "[cfdata-extract] 排除出口地区（loc）: %s\n", strings.Join(excludeList, ","))
 	}
 
 	f, err := os.Open(csvPath)
@@ -210,18 +224,34 @@ func runFilterMode(csvPath, region, locPath, locURL, cacheDir, outPath string) {
 	}
 	ipCol := findColumn(header, "IP地址", "IP", "ip")
 	portCol := findColumn(header, "端口号", "端口", "port")
-	dcCol := findColumn(header, "数据中心", "colo", "dc", "datacenter")
-	if ipCol < 0 || portCol < 0 || dcCol < 0 {
-		fatal("扫描结果缺少必要列（IP地址/端口号/数据中心），当前表头: %s", strings.Join(header, ","))
+	dcCol := -1
+	if hasRegion {
+		dcCol = findColumn(header, "数据中心", "colo", "dc", "datacenter")
+	}
+	locCol := -1
+	if len(excludeSet) > 0 {
+		locCol = findColumn(header, "源IP位置", "loc", "location", "country", "国家码", "出口地区")
+	}
+	if ipCol < 0 || portCol < 0 {
+		fatal("扫描结果缺少必要列（IP地址/端口号），当前表头: %s", strings.Join(header, ","))
+	}
+	if hasRegion && dcCol < 0 {
+		fatal("扫描结果缺少「数据中心」列，无法按地区筛选，当前表头: %s", strings.Join(header, ","))
+	}
+	if len(excludeSet) > 0 && locCol < 0 {
+		fatal("扫描结果缺少「源IP位置」列，无法按出口地区排除，当前表头: %s", strings.Join(header, ","))
 	}
 
 	var (
-		rows    int
-		kept    []entry
-		seen    = make(map[string]struct{}, 512)
-		hit     = make(map[string]int, len(targets))
-		all     = make(map[string]int, 64) // 全量扫描里的机房分布，无命中时用于提示
-		unknown int
+		rows     int
+		kept     []entry
+		seen     = make(map[string]struct{}, 512)
+		hit      = make(map[string]int, len(targets))
+		all      = make(map[string]int, 64) // 全量扫描里的机房分布，无命中时用于提示
+		unknown  int                        // 缺机房信息的行数
+		excluded = make(map[string]int, 8)  // 按出口地区统计的排除条数
+		locAll   = make(map[string]int, 64) // 全量扫描里的出口地区分布
+		locEmpty int                        // 缺出口地区信息的行数
 	)
 	for {
 		rec, err := reader.Read()
@@ -229,19 +259,37 @@ func runFilterMode(csvPath, region, locPath, locURL, cacheDir, outPath string) {
 			break
 		}
 		rows++
-		if len(rec) <= ipCol || len(rec) <= portCol || len(rec) <= dcCol {
+		if len(rec) <= ipCol || len(rec) <= portCol {
 			continue
 		}
-		colo := strings.ToUpper(strings.TrimSpace(rec[dcCol]))
 		host := strings.TrimSpace(rec[ipCol])
 		portStr := strings.TrimSpace(rec[portCol])
-		if colo == "" {
-			unknown++
-			continue
+		colo := ""
+		if hasRegion {
+			colo = strings.ToUpper(strings.TrimSpace(rec[dcCol]))
+			if colo == "" {
+				unknown++
+				continue
+			}
+			all[colo]++
+			if _, ok := targets[colo]; !ok {
+				continue
+			}
 		}
-		all[colo]++
-		if _, ok := targets[colo]; !ok {
-			continue
+		if len(excludeSet) > 0 {
+			loc := ""
+			if len(rec) > locCol {
+				loc = strings.ToUpper(strings.TrimSpace(rec[locCol]))
+			}
+			if loc == "" {
+				locEmpty++
+			} else {
+				locAll[loc]++
+				if _, ok := excludeSet[loc]; ok {
+					excluded[loc]++
+					continue
+				}
+			}
 		}
 		port, ok := parsePort(portStr)
 		if !ok || host == "" {
@@ -252,7 +300,9 @@ func runFilterMode(csvPath, region, locPath, locURL, cacheDir, outPath string) {
 			continue
 		}
 		seen[key] = struct{}{}
-		hit[colo]++
+		if hasRegion {
+			hit[colo]++
+		}
 		kept = append(kept, entry{host: host, port: port})
 	}
 
@@ -265,38 +315,56 @@ func runFilterMode(csvPath, region, locPath, locURL, cacheDir, outPath string) {
 		dist = append(dist, fmt.Sprintf("%s=%d", colo, n))
 	}
 	sort.Strings(dist)
-	fmt.Fprintf(os.Stderr, "[cfdata-extract] 扫描结果 %d 行，命中地区 %d 条 -> %s\n", rows, len(kept), outPath)
+	fmt.Fprintf(os.Stderr, "[cfdata-extract] 扫描结果 %d 行，命中 %d 条 -> %s\n", rows, len(kept), outPath)
 	if len(dist) > 0 {
 		fmt.Fprintf(os.Stderr, "[cfdata-extract] 机房分布: %s\n", strings.Join(dist, " "))
+	}
+	if len(excluded) > 0 {
+		parts := make([]string, 0, len(excluded))
+		total := 0
+		for loc, n := range excluded {
+			parts = append(parts, fmt.Sprintf("%s=%d", loc, n))
+			total += n
+		}
+		sort.Strings(parts)
+		fmt.Fprintf(os.Stderr, "[cfdata-extract] 按出口地区排除 %d 条（%s）\n", total, strings.Join(parts, " "))
+	}
+	if len(locAll) > 0 && len(kept) == 0 {
+		fmt.Fprintf(os.Stderr, "[cfdata-extract] 出口地区分布: %s\n", formatCounter(locAll, 12))
+	}
+	if locEmpty > 0 {
+		warn("有 %d 行缺少出口地区信息（loc 为空），无法判定，已保留", locEmpty)
 	}
 	if unknown > 0 {
 		warn("有 %d 行缺少机房信息（colo 为空），已跳过", unknown)
 	}
-	if len(kept) == 0 {
-		warn("目标地区没有任何可用地址；本次扫描实际出现的机房如下（可作为地区码参考）:")
-		type kv struct {
-			k string
-			n int
-		}
-		list := make([]kv, 0, len(all))
-		for k, n := range all {
-			list = append(list, kv{k, n})
-		}
-		sort.Slice(list, func(i, j int) bool {
-			if list[i].n != list[j].n {
-				return list[i].n > list[j].n
-			}
-			return list[i].k < list[j].k
-		})
-		if len(list) > 12 {
-			list = list[:12]
-		}
-		parts := make([]string, 0, len(list))
-		for _, it := range list {
-			parts = append(parts, fmt.Sprintf("%s(%d)", it.k, it.n))
-		}
-		if len(parts) > 0 {
-			fmt.Fprintf(os.Stderr, "[cfdata-extract] 机房分布 Top: %s\n", strings.Join(parts, " "))
-		}
+	if len(kept) == 0 && hasRegion && len(all) > 0 {
+		warn("没有地址落在筛选的机房内；本次扫描实际出现的机房 Top（可作为地区码参考）: %s", formatCounter(all, 12))
 	}
+}
+
+// formatCounter 把计数 map 整理成 "K(n) K(n)" 的 Top-N 串：次数降序，同次数按名称升序。
+func formatCounter(m map[string]int, top int) string {
+	type kv struct {
+		k string
+		n int
+	}
+	list := make([]kv, 0, len(m))
+	for k, n := range m {
+		list = append(list, kv{k, n})
+	}
+	sort.Slice(list, func(i, j int) bool {
+		if list[i].n != list[j].n {
+			return list[i].n > list[j].n
+		}
+		return list[i].k < list[j].k
+	})
+	if top > 0 && len(list) > top {
+		list = list[:top]
+	}
+	parts := make([]string, 0, len(list))
+	for _, it := range list {
+		parts = append(parts, fmt.Sprintf("%s(%d)", it.k, it.n))
+	}
+	return strings.Join(parts, " ")
 }
