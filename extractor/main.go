@@ -467,8 +467,9 @@ func readSources(path string) ([]string, error) {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 			continue
 		}
-		// 支持「URL  # 备注」形式的行尾注释
-		if i := strings.Index(line, " #"); i > 0 {
+		// 行尾 "#备注" 先去掉:只认 " #" 会漏掉 "URL#备注" 这类写法,
+		// 后缀会让本地文件读不到、裸地址判不成内联地址,整条来源被跳过
+		if i := strings.Index(line, "#"); i >= 0 {
 			line = strings.TrimSpace(line[:i])
 		}
 		if line == "" || seen[line] {
